@@ -46,7 +46,7 @@ Bevdox - DevBox RDP Launcher
   3   my-devbox                      anotherproject       Running      westus3
   4   test-box                       testproject          Stopped      eastus
 
-  ↑↓ Navigate  Enter/1-9 Launch  N Rename  R Reload  Q Quit
+  ↑↓ Navigate  Enter/1-9 Launch  Esc Cancel launch  N Rename  R Reload  Q Quit
 ```
 
 | Key | Action |
@@ -54,6 +54,7 @@ Bevdox - DevBox RDP Launcher
 | `↑` / `↓` | Move selection up/down |
 | `Enter` | Launch selected Dev Box |
 | `1`–`9` | Launch Dev Box by number |
+| `Esc` | Cancel a pending launch |
 | `N` | Rename selected instance |
 | `R` | Force reload of instance list (ignored while a refresh is already running) |
 | `Q` | Quit |
@@ -91,6 +92,8 @@ Authentication happens on the background thread during discovery, so it never bl
 ### Launching
 
 When you select a Dev Box, Bevdox calls the DevCenter [remote connection API](https://learn.microsoft.com/en-us/rest/api/devcenter/developer/dev-boxes/get-remote-connection) to get the `rdpConnectionUrl` and opens it via `ms-avd://` protocol handler, which launches the Windows Remote Desktop Client. Hibernated and stopped instances are auto-started by the remote desktop client.
+
+The launch runs in the background: the menu stays responsive, the status line shows the current step (authenticating, requesting the connection, opening Remote Desktop), and `Esc` cancels it. If the launch fails, the error is shown in the status line and you stay in the menu.
 
 ## Project Structure
 

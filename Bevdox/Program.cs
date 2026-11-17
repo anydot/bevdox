@@ -67,6 +67,18 @@ string lastRenderedStatus = "";
 Task<ConsoleKeyInfo>? keyTask = null;
 Task? statusWait = null;
 
+// Launch runs in the background so the menu stays responsive while authenticating
+Task? launchTask = null;
+CancellationTokenSource? launchCts = null;
+DevBoxInstance? launchTarget = null;
+string launchStatus = "";
+string? launchError = null;
+var launchProgress = new InlineProgress<string>(s =>
+{
+    launchStatus = s;
+    statusChanged.Release();
+});
+
 while (!cts.Token.IsCancellationRequested)
 {
     // Integrate a finished background refresh, including failures, so it never lingers as "refreshing"
@@ -84,6 +96,36 @@ while (!cts.Token.IsCancellationRequested)
             refreshError = $"✗ Refresh failed: {FirstLine(ex.Message)}";
         }
         refreshTask = null;
+        redraw = true;
+    }
+
+    // Integrate a finished launch: exit on success, otherwise report it and stay in the menu
+    if (launchTask is { IsCompleted: true })
+    {
+        var target = launchTarget!;
+        try
+        {
+            await launchTask;
+            Console.WriteLine();
+            Console.WriteLine($"  Launched {target.EffectiveName}.");
+            goto exit;
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
+        catch (OperationCanceledException) when (launchCts!.IsCancellationRequested)
+        {
+            launchError = $"✗ Launch of {target.EffectiveName} cancelled";
+        }
+        catch (Exception ex)
+        {
+            launchError = $"✗ Launch of {target.EffectiveName} failed: {FirstLine(ex.Message)}";
+        }
+        finally
+        {
+            launchCts!.Dispose();
+            launchCts = null;
+            launchTask = null;
+            launchTarget = null;
+        }
         redraw = true;
     }
 
@@ -108,11 +150,11 @@ while (!cts.Token.IsCancellationRequested)
         Console.WriteLine();
         DisplayMenu(sorted, selectedIndex);
         Console.WriteLine();
-        Console.Write("  ↑↓ Navigate  Enter/1-9 Launch  N Rename  R Reload  Q Quit");
+        Console.Write("  ↑↓ Navigate  Enter/1-9 Launch  Esc Cancel launch  N Rename  R Reload  Q Quit");
         redraw = false;
     }
 
-    // Await key press, status change or refresh completion — no polling
+    // Await key press, status change, refresh or launch completion — no polling
     keyTask ??= Task.Run(() => Console.ReadKey(intercept: true));
     // Reuse the pending wait across key presses: an abandoned WaitAsync would
     // still consume a later Release and the UI would miss that status update.
@@ -120,6 +162,7 @@ while (!cts.Token.IsCancellationRequested)
 
     var waits = new List<Task> { keyTask, statusWait };
     if (refreshTask is not null) waits.Add(refreshTask);
+    if (launchTask is not null) waits.Add(launchTask);
 
     var completed = await Task.WhenAny(waits);
     if (completed != keyTask)
@@ -148,21 +191,9 @@ while (!cts.Token.IsCancellationRequested)
     if (digitValue >= 1 && digitValue <= sorted.Count)
     {
         selectedIndex = digitValue - 1;
-        var selected = sorted[selectedIndex];
-        Console.WriteLine();
-        try
-        {
-            await launcher.LaunchAsync(selected, cts.Token);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"  Launch failed: {ex.Message}");
-            Console.Write("  Press any key to continue...");
-            Console.ReadKey(intercept: true);
-            redraw = true;
-            continue;
-        }
-        goto exit;
+        StartLaunch(sorted[selectedIndex]);
+        redraw = true;
+        continue;
     }
 
     switch (key.Key)
@@ -184,25 +215,16 @@ while (!cts.Token.IsCancellationRequested)
             break;
 
         case ConsoleKey.Enter:
-        {
-            var selected = sorted[selectedIndex];
-            Console.WriteLine();
-            try
-            {
-                await launcher.LaunchAsync(selected, cts.Token);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  Launch failed: {ex.Message}");
-                Console.Write("  Press any key to continue...");
-                Console.ReadKey(intercept: true);
-                redraw = true;
-                break;
-            }
-            goto exit;
-        }
+            StartLaunch(sorted[selectedIndex]);
+            redraw = true;
+            break;
+
+        case ConsoleKey.Escape:
+            launchCts?.Cancel();
+            break;
 
         case ConsoleKey.Q:
+            launchCts?.Cancel();
             goto exit;
 
         case ConsoleKey.R:
@@ -218,6 +240,8 @@ while (!cts.Token.IsCancellationRequested)
 
         case ConsoleKey.N:
         {
+            // Renaming reads a whole line synchronously; don't start it while a launch is pending
+            if (launchTask is not null) break;
             Console.WriteLine();
             await HandleRenameAsync(sorted, selectedIndex, config, configStore, cts.Token);
             redraw = true;
@@ -263,8 +287,24 @@ Task<List<DevBoxInstance>> StartRefresh()
 
 string ActivityText()
 {
-    if (refreshTask is not null) return $"⟳ {refreshStatus}";
-    return refreshError ?? "";
+    var parts = new List<string>();
+    if (launchTask is not null) parts.Add($"▶ {launchTarget!.EffectiveName}: {launchStatus} (Esc to cancel)");
+    else if (launchError is not null) parts.Add(launchError);
+    if (refreshTask is not null) parts.Add($"⟳ {refreshStatus}");
+    else if (refreshError is not null) parts.Add(refreshError);
+    return string.Join("  │ ", parts);
+}
+
+void StartLaunch(DevBoxInstance target)
+{
+    // One launch at a time; Esc cancels the pending one
+    if (launchTask is not null) return;
+    launchTarget = target;
+    launchStatus = "Starting...";
+    launchError = null;
+    launchCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+    var token = launchCts.Token;
+    launchTask = Task.Run(() => launcher.LaunchAsync(target, launchProgress, token), token);
 }
 
 // --- Helper methods ---
