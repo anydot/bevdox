@@ -55,7 +55,7 @@ Bevdox - DevBox RDP Launcher
 | `Enter` | Launch selected Dev Box |
 | `1`–`9` | Launch Dev Box by number |
 | `N` | Rename selected instance |
-| `R` | Force reload of instance list |
+| `R` | Force reload of instance list (ignored while a refresh is already running) |
 | `Q` | Quit |
 
 ## How It Works
@@ -74,7 +74,7 @@ The instance list is cached as JSON at `{OneDrive}/.config/bevdox`. The cache in
 - All discovered instances with their state, project, location, and pool
 - User-assigned display names (preserved across refreshes)
 
-On startup, if the cache is available, it's shown immediately. A background refresh runs automatically; if the cache is older than 1 hour, a fresh discovery is triggered. The merge logic protects against empty results (e.g., from auth failures) overwriting a valid cache.
+On startup, if the cache is available, it's shown immediately. A background refresh runs automatically; if the cache is older than 1 hour, a fresh discovery is triggered. The merge logic protects against empty results (e.g., from auth failures) overwriting a valid cache. If a background refresh fails, the error is shown in the status line until the next refresh.
 
 The config location is resolved in order: `%OneDriveCommercial%` → `%OneDrive%` → `%USERPROFILE%`.
 
