@@ -47,9 +47,19 @@ public sealed class ConfigStore
 
     /// <summary>
     /// Merges fresh discovery results into the existing config, preserving user renames.
+    /// Cached instances of projects that failed to respond are kept rather than dropped.
     /// </summary>
-    public static BevdoxConfig Merge(BevdoxConfig existing, List<DevBoxInstance> freshInstances)
+    public static BevdoxConfig Merge(BevdoxConfig existing, List<DevBoxInstance> freshInstances, IReadOnlyCollection<ProjectFailure>? failedProjects = null)
     {
+        if (failedProjects is { Count: > 0 })
+        {
+            freshInstances = freshInstances
+                .Concat(existing.Instances.Where(i => failedProjects.Any(f =>
+                    string.Equals(f.ProjectName, i.ProjectName, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(f.DevCenterUri, i.DevCenterUri, StringComparison.OrdinalIgnoreCase))))
+                .ToList();
+        }
+
         var renameMap = existing.Instances
             .Where(i => i.DisplayName is not null)
             .ToDictionary(i => i.UniqueId, i => i.DisplayName, StringComparer.OrdinalIgnoreCase);

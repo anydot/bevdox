@@ -15,6 +15,8 @@ var config = await configStore.LoadAsync(cts.Token);
 
 // Background refresh with progress reporting
 string refreshStatus = "Starting...";
+// When the current refresh step started, to show how long it has been waiting
+DateTime refreshStepStarted = DateTime.UtcNow;
 // Outcome of the last completed refresh when it needs the user's attention
 string? refreshError = null;
 // Signal when refresh status changes so the UI can update immediately
@@ -22,30 +24,32 @@ var statusChanged = new SemaphoreSlim(0);
 var progress = new InlineProgress<string>(s =>
 {
     refreshStatus = s;
+    refreshStepStarted = DateTime.UtcNow;
     statusChanged.Release();
 });
 
-Task<List<DevBoxInstance>>? refreshTask = StartRefresh();
+Task<DiscoveryResult>? refreshTask = StartRefresh();
 
 if (config.Instances.Count == 0)
 {
     // No cache — must wait for discovery
     Console.WriteLine("Bevdox - DevBox RDP Launcher");
-    Console.Write($"  {refreshStatus}");
+    Console.Write($"  {RefreshText()}");
     while (!refreshTask.IsCompleted)
     {
         await Task.Delay(200, cts.Token);
         Console.SetCursorPosition(0, Console.CursorTop);
-        Console.Write($"  {refreshStatus,-60}");
+        Console.Write($"  {RefreshText(),-60}");
     }
     Console.WriteLine();
 
     try
     {
-        var freshInstances = await refreshTask;
-        config = ConfigStore.Merge(config, freshInstances);
+        var result = await refreshTask;
+        config = ConfigStore.Merge(config, result.Instances, result.Failures);
         await configStore.SaveAsync(config, cts.Token);
         refreshTask = null;
+        refreshError = FailureSummary(result);
     }
     catch (Exception ex)
     {
@@ -57,6 +61,7 @@ if (config.Instances.Count == 0)
 if (config.Instances.Count == 0)
 {
     Console.WriteLine("  No Dev Box instances found.");
+    if (refreshError is not null) Console.WriteLine($"  {refreshError}");
     return 0;
 }
 
@@ -66,16 +71,20 @@ bool redraw = true;
 string lastRenderedStatus = "";
 Task<ConsoleKeyInfo>? keyTask = null;
 Task? statusWait = null;
+// Ticks once a second while work is pending so the elapsed time stays current
+Task? tickTask = null;
 
 // Launch runs in the background so the menu stays responsive while authenticating
 Task? launchTask = null;
 CancellationTokenSource? launchCts = null;
 DevBoxInstance? launchTarget = null;
 string launchStatus = "";
+DateTime launchStepStarted = DateTime.UtcNow;
 string? launchError = null;
 var launchProgress = new InlineProgress<string>(s =>
 {
     launchStatus = s;
+    launchStepStarted = DateTime.UtcNow;
     statusChanged.Release();
 });
 
@@ -86,9 +95,10 @@ while (!cts.Token.IsCancellationRequested)
     {
         try
         {
-            var freshInstances = await refreshTask;
-            config = ConfigStore.Merge(config, freshInstances);
+            var result = await refreshTask;
+            config = ConfigStore.Merge(config, result.Instances, result.Failures);
             await configStore.SaveAsync(config, cts.Token);
+            refreshError = FailureSummary(result);
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
         catch (Exception ex)
@@ -163,6 +173,8 @@ while (!cts.Token.IsCancellationRequested)
     var waits = new List<Task> { keyTask, statusWait };
     if (refreshTask is not null) waits.Add(refreshTask);
     if (launchTask is not null) waits.Add(launchTask);
+    if (refreshTask is not null || launchTask is not null)
+        waits.Add(tickTask ??= Task.Delay(TimeSpan.FromSeconds(1), cts.Token));
 
     var completed = await Task.WhenAny(waits);
     if (completed != keyTask)
@@ -172,6 +184,10 @@ while (!cts.Token.IsCancellationRequested)
             // Status changed — drain any extra signals and loop to update display
             statusWait = null;
             while (statusChanged.Wait(0)) { }
+        }
+        else if (completed == tickTask)
+        {
+            tickTask = null;
         }
         continue;
     }
@@ -257,18 +273,19 @@ if (refreshTask is not null)
     try
     {
         Console.WriteLine();
-        Console.Write($"  ⟳ {refreshStatus}");
+        Console.Write($"  ⟳ {RefreshText()}");
         while (!refreshTask.IsCompleted)
         {
             await Task.Delay(200);
             Console.SetCursorPosition(0, Console.CursorTop);
-            Console.Write($"  ⟳ {refreshStatus,-60}");
+            Console.Write($"  ⟳ {RefreshText(),-60}");
         }
-        var freshInstances = await refreshTask;
-        var merged = ConfigStore.Merge(config, freshInstances);
+        var result = await refreshTask;
+        var merged = ConfigStore.Merge(config, result.Instances, result.Failures);
         await configStore.SaveAsync(merged, cts.Token);
         Console.SetCursorPosition(0, Console.CursorTop);
         Console.WriteLine($"  ✓ {refreshStatus,-60}");
+        if (FailureSummary(result) is { } failures) Console.WriteLine($"  {failures}");
     }
     catch (OperationCanceledException) { }
     catch (Exception ex)
@@ -278,19 +295,22 @@ if (refreshTask is not null)
 }
 return 0;
 
-Task<List<DevBoxInstance>> StartRefresh()
+Task<DiscoveryResult> StartRefresh()
 {
     refreshStatus = "Starting...";
+    refreshStepStarted = DateTime.UtcNow;
     refreshError = null;
     return Task.Run(() => discovery.DiscoverAsync(progress, cts.Token), cts.Token);
 }
 
+string RefreshText() => refreshStatus + ElapsedText(refreshStepStarted);
+
 string ActivityText()
 {
     var parts = new List<string>();
-    if (launchTask is not null) parts.Add($"▶ {launchTarget!.EffectiveName}: {launchStatus} (Esc to cancel)");
+    if (launchTask is not null) parts.Add($"▶ {launchTarget!.EffectiveName}: {launchStatus}{ElapsedText(launchStepStarted)} (Esc to cancel)");
     else if (launchError is not null) parts.Add(launchError);
-    if (refreshTask is not null) parts.Add($"⟳ {refreshStatus}");
+    if (refreshTask is not null) parts.Add($"⟳ {RefreshText()}");
     else if (refreshError is not null) parts.Add(refreshError);
     return string.Join("  │ ", parts);
 }
@@ -301,6 +321,7 @@ void StartLaunch(DevBoxInstance target)
     if (launchTask is not null) return;
     launchTarget = target;
     launchStatus = "Starting...";
+    launchStepStarted = DateTime.UtcNow;
     launchError = null;
     launchCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
     var token = launchCts.Token;
@@ -329,6 +350,16 @@ static string FirstLine(string message)
     var newline = message.IndexOfAny(['\r', '\n']);
     return newline < 0 ? message : message[..newline];
 }
+
+// Only shown once a step takes noticeably long, e.g. a token request that is waiting on sign-in
+static string ElapsedText(DateTime stepStarted)
+{
+    var elapsed = DateTime.UtcNow - stepStarted;
+    return elapsed.TotalSeconds < 2 ? "" : $" ({(int)elapsed.TotalSeconds}s)";
+}
+
+static string? FailureSummary(DiscoveryResult result) => result.Failures.Count == 0 ? null
+    : $"⚠ {result.Failures.Count}/{result.ProjectCount} project(s) failed — {result.Failures[0].Error}";
 
 // Pad to clear leftovers of a longer previous status, and truncate to avoid wrapping into the next row.
 static string FitToWidth(string line)

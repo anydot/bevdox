@@ -87,7 +87,7 @@ Two token scopes are used:
 - `https://management.azure.com/.default` — for Azure Resource Graph queries
 - `https://devcenter.azure.com/.default` — for DevCenter data plane API calls
 
-Authentication happens on the background thread during discovery, so it never blocks menu interaction when a cached instance list is available.
+Authentication happens on the background thread during discovery, so it never blocks menu interaction when a cached instance list is available. The status line shows which step is running (authenticating to Azure Resource Manager or Dev Center, querying Resource Graph, querying projects) and, once a step takes longer than a couple of seconds, how long it has been waiting. Projects that fail to respond keep their previously cached dev boxes; a summary with the first error is shown in the status line.
 
 ### Launching
 
