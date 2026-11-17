@@ -6,19 +6,23 @@ using Bevdox.Models;
 
 namespace Bevdox.Services;
 
+public sealed record ProjectFailure(string ProjectName, string DevCenterUri, string Error);
+
+public sealed record DiscoveryResult(List<DevBoxInstance> Instances, int ProjectCount, IReadOnlyList<ProjectFailure> Failures);
+
 public sealed class DevBoxDiscovery(AuthService auth)
 {
     private const string ArgEndpoint = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01";
 
     private static readonly HttpClient Http = new();
 
-    public async Task<List<DevBoxInstance>> DiscoverAsync(IProgress<string>? progress = null, CancellationToken ct = default)
+    public async Task<DiscoveryResult> DiscoverAsync(IProgress<string>? progress = null, CancellationToken ct = default)
     {
-        progress?.Report("Authenticating...");
+        progress?.Report("Authenticating to Azure Resource Manager...");
         var armToken = await auth.GetArmTokenAsync(ct);
 
         // Step 1: Query ARG for all DevCenter projects to get their endpoints
-        progress?.Report("Querying projects...");
+        progress?.Report("Querying projects (Resource Graph)...");
         var projects = await QueryArgAsync(armToken, """
             resources
             | where type =~ 'microsoft.devcenter/projects'
@@ -36,31 +40,35 @@ public sealed class DevBoxDiscovery(AuthService auth)
         }
 
         // Step 2: Query each project's DevCenter data plane for dev boxes (in parallel, max 4)
-        progress?.Report($"Querying 0/{projectInfos.Count} projects...");
+        progress?.Report("Authenticating to Dev Center...");
         var devCenterToken = await auth.GetDevCenterTokenAsync(ct);
+        progress?.Report($"Querying 0/{projectInfos.Count} projects...");
 
         int completed = 0;
         var allInstances = new List<DevBoxInstance>();
+        var failures = new List<ProjectFailure>();
         var lockObj = new object();
 
         await Parallel.ForEachAsync(projectInfos,
             new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = ct },
             async (p, token) =>
             {
-                var result = await ListDevBoxesForProjectAsync(devCenterToken, p.Name, p.DevCenterUri, p.Location, token);
+                var (instances, error) = await ListDevBoxesForProjectAsync(devCenterToken, p.Name, p.DevCenterUri, p.Location, token);
                 lock (lockObj)
                 {
-                    allInstances.AddRange(result);
+                    allInstances.AddRange(instances);
+                    if (error is not null) failures.Add(new ProjectFailure(p.Name, p.DevCenterUri, error));
                     completed++;
                     progress?.Report($"Querying {completed}/{projectInfos.Count} projects...");
                 }
             });
 
-        progress?.Report($"Done — found {allInstances.Count} dev box(es).");
-        return allInstances;
+        var failureText = failures.Count > 0 ? $", {failures.Count} project(s) failed" : "";
+        progress?.Report($"Done — found {allInstances.Count} dev box(es){failureText}.");
+        return new DiscoveryResult(allInstances, projectInfos.Count, failures);
     }
 
-    private static async Task<List<DevBoxInstance>> ListDevBoxesForProjectAsync(
+    private static async Task<(List<DevBoxInstance> Instances, string? Error)> ListDevBoxesForProjectAsync(
         string token, string projectName, string devCenterUri, string location, CancellationToken ct)
     {
         try
@@ -73,7 +81,7 @@ public sealed class DevBoxDiscovery(AuthService auth)
             using var response = await Http.SendAsync(request, ct);
 
             if (!response.IsSuccessStatusCode)
-                return [];
+                return ([], $"{projectName}: HTTP {(int)response.StatusCode} {response.ReasonPhrase}");
 
             var json = await response.Content.ReadAsStringAsync(ct);
             using var doc = JsonDocument.Parse(json);
@@ -108,12 +116,14 @@ public sealed class DevBoxDiscovery(AuthService auth)
             }
         }
 
-        return instances;
+        return (instances, null);
         }
-        catch (OperationCanceledException) { throw; }
-        catch
+        // An HttpClient timeout also surfaces as OperationCanceledException; only propagate real cancellation
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
         {
-            return [];
+            var message = ex.Message.Split(['\r', '\n'], 2)[0];
+            return ([], $"{projectName}: {message}");
         }
     }
 
