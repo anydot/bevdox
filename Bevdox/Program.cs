@@ -15,7 +15,8 @@ var config = await configStore.LoadAsync(cts.Token);
 
 // Background refresh with progress reporting
 string refreshStatus = "Starting...";
-bool refreshDone = false;
+// Outcome of the last completed refresh when it needs the user's attention
+string? refreshError = null;
 // Signal when refresh status changes so the UI can update immediately
 var statusChanged = new SemaphoreSlim(0);
 var progress = new InlineProgress<string>(s =>
@@ -24,12 +25,7 @@ var progress = new InlineProgress<string>(s =>
     statusChanged.Release();
 });
 
-Task<List<DevBoxInstance>>? refreshTask = Task.Run(async () =>
-{
-    var result = await discovery.DiscoverAsync(progress, cts.Token);
-    refreshDone = true;
-    return result;
-}, cts.Token);
+Task<List<DevBoxInstance>>? refreshTask = StartRefresh();
 
 if (config.Instances.Count == 0)
 {
@@ -73,11 +69,8 @@ Task? statusWait = null;
 
 while (!cts.Token.IsCancellationRequested)
 {
-    var sorted = config.Instances.OrderBy(i => i.EffectiveName, StringComparer.OrdinalIgnoreCase).ToList();
-    if (selectedIndex >= sorted.Count) selectedIndex = sorted.Count - 1;
-
-    // Check if background refresh completed since last draw
-    if (refreshTask is not null && refreshDone && !redraw)
+    // Integrate a finished background refresh, including failures, so it never lingers as "refreshing"
+    if (refreshTask is { IsCompleted: true })
     {
         try
         {
@@ -85,18 +78,24 @@ while (!cts.Token.IsCancellationRequested)
             config = ConfigStore.Merge(config, freshInstances);
             await configStore.SaveAsync(config, cts.Token);
         }
-        catch { /* ignore */ }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            refreshError = $"✗ Refresh failed: {FirstLine(ex.Message)}";
+        }
         refreshTask = null;
-        refreshDone = false;
         redraw = true;
-        continue;
     }
 
+    var sorted = config.Instances.OrderBy(i => i.EffectiveName, StringComparer.OrdinalIgnoreCase).ToList();
+    if (selectedIndex >= sorted.Count) selectedIndex = sorted.Count - 1;
+
     // Check if status text changed — update just the status line
-    if (!redraw && refreshStatus != lastRenderedStatus)
+    var activity = ActivityText();
+    if (!redraw && activity != lastRenderedStatus)
     {
-        UpdateStatusLine(config, refreshTask is not null, refreshStatus);
-        lastRenderedStatus = refreshStatus;
+        UpdateStatusLine(config, activity);
+        lastRenderedStatus = activity;
     }
 
     if (redraw)
@@ -104,8 +103,8 @@ while (!cts.Token.IsCancellationRequested)
         Console.Clear();
         Console.WriteLine("Bevdox - DevBox RDP Launcher");
         Console.WriteLine();
-        DisplayStatusLine(config, refreshTask is not null, refreshStatus);
-        lastRenderedStatus = refreshStatus;
+        DisplayStatusLine(config, activity);
+        lastRenderedStatus = activity;
         Console.WriteLine();
         DisplayMenu(sorted, selectedIndex);
         Console.WriteLine();
@@ -113,18 +112,24 @@ while (!cts.Token.IsCancellationRequested)
         redraw = false;
     }
 
-    // Await key press or status change — no polling
+    // Await key press, status change or refresh completion — no polling
     keyTask ??= Task.Run(() => Console.ReadKey(intercept: true));
     // Reuse the pending wait across key presses: an abandoned WaitAsync would
     // still consume a later Release and the UI would miss that status update.
     statusWait ??= statusChanged.WaitAsync(cts.Token);
 
-    var completed = await Task.WhenAny(keyTask, statusWait);
-    if (completed == statusWait)
+    var waits = new List<Task> { keyTask, statusWait };
+    if (refreshTask is not null) waits.Add(refreshTask);
+
+    var completed = await Task.WhenAny(waits);
+    if (completed != keyTask)
     {
-        // Status changed — drain any extra signals and loop to update display
-        statusWait = null;
-        while (statusChanged.Wait(0)) { }
+        if (completed == statusWait)
+        {
+            // Status changed — drain any extra signals and loop to update display
+            statusWait = null;
+            while (statusChanged.Wait(0)) { }
+        }
         continue;
     }
 
@@ -202,15 +207,12 @@ while (!cts.Token.IsCancellationRequested)
 
         case ConsoleKey.R:
         {
-            refreshDone = false;
-            refreshStatus = "Starting...";
-            refreshTask = Task.Run(async () =>
+            // Ignore while a refresh is in flight: overlapping refreshes would race over the same state
+            if (refreshTask is null)
             {
-                var result = await discovery.DiscoverAsync(progress, cts.Token);
-                refreshDone = true;
-                return result;
-            }, cts.Token);
-            redraw = true;
+                refreshTask = StartRefresh();
+                redraw = true;
+            }
             break;
         }
 
@@ -252,9 +254,22 @@ if (refreshTask is not null)
 }
 return 0;
 
+Task<List<DevBoxInstance>> StartRefresh()
+{
+    refreshStatus = "Starting...";
+    refreshError = null;
+    return Task.Run(() => discovery.DiscoverAsync(progress, cts.Token), cts.Token);
+}
+
+string ActivityText()
+{
+    if (refreshTask is not null) return $"⟳ {refreshStatus}";
+    return refreshError ?? "";
+}
+
 // --- Helper methods ---
 
-static void DisplayStatusLine(BevdoxConfig config, bool refreshing, string refreshStatus)
+static void DisplayStatusLine(BevdoxConfig config, string activity)
 {
     var cacheText = "";
     if (config.LastRefreshUtc is not null)
@@ -265,8 +280,14 @@ static void DisplayStatusLine(BevdoxConfig config, bool refreshing, string refre
             $"Cache: {(int)ago.TotalHours}h {ago.Minutes}m ago";
     }
 
-    var statusText = refreshing ? $"  │ ⟳ {refreshStatus}" : "";
+    var statusText = activity.Length > 0 ? $"  │ {activity}" : "";
     Console.WriteLine(FitToWidth($"  {cacheText}{statusText}"));
+}
+
+static string FirstLine(string message)
+{
+    var newline = message.IndexOfAny(['\r', '\n']);
+    return newline < 0 ? message : message[..newline];
 }
 
 // Pad to clear leftovers of a longer previous status, and truncate to avoid wrapping into the next row.
@@ -276,12 +297,12 @@ static string FitToWidth(string line)
     return line.Length > width ? line[..width] : line.PadRight(width);
 }
 
-static void UpdateStatusLine(BevdoxConfig config, bool refreshing, string refreshStatus)
+static void UpdateStatusLine(BevdoxConfig config, string activity)
 {
     // Status line is on row 2 (0=title, 1=blank, 2=status)
     var (savedLeft, savedTop) = (Console.CursorLeft, Console.CursorTop);
     Console.SetCursorPosition(0, 2);
-    DisplayStatusLine(config, refreshing, refreshStatus);
+    DisplayStatusLine(config, activity);
     Console.SetCursorPosition(savedLeft, savedTop);
 }
 
