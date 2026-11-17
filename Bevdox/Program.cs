@@ -18,7 +18,7 @@ string refreshStatus = "Starting...";
 bool refreshDone = false;
 // Signal when refresh status changes so the UI can update immediately
 var statusChanged = new SemaphoreSlim(0);
-var progress = new Progress<string>(s =>
+var progress = new InlineProgress<string>(s =>
 {
     refreshStatus = s;
     statusChanged.Release();
@@ -69,6 +69,7 @@ int selectedIndex = 0;
 bool redraw = true;
 string lastRenderedStatus = "";
 Task<ConsoleKeyInfo>? keyTask = null;
+Task? statusWait = null;
 
 while (!cts.Token.IsCancellationRequested)
 {
@@ -114,14 +115,16 @@ while (!cts.Token.IsCancellationRequested)
 
     // Await key press or status change — no polling
     keyTask ??= Task.Run(() => Console.ReadKey(intercept: true));
-    var statusWait = statusChanged.WaitAsync(cts.Token);
+    // Reuse the pending wait across key presses: an abandoned WaitAsync would
+    // still consume a later Release and the UI would miss that status update.
+    statusWait ??= statusChanged.WaitAsync(cts.Token);
 
     var completed = await Task.WhenAny(keyTask, statusWait);
     if (completed == statusWait)
     {
         // Status changed — drain any extra signals and loop to update display
-        while (statusChanged.CurrentCount > 0)
-            await statusChanged.WaitAsync();
+        statusWait = null;
+        while (statusChanged.Wait(0)) { }
         continue;
     }
 
@@ -263,7 +266,14 @@ static void DisplayStatusLine(BevdoxConfig config, bool refreshing, string refre
     }
 
     var statusText = refreshing ? $"  │ ⟳ {refreshStatus}" : "";
-    Console.WriteLine($"  {cacheText}{statusText}");
+    Console.WriteLine(FitToWidth($"  {cacheText}{statusText}"));
+}
+
+// Pad to clear leftovers of a longer previous status, and truncate to avoid wrapping into the next row.
+static string FitToWidth(string line)
+{
+    var width = Math.Max(Console.WindowWidth - 1, 1);
+    return line.Length > width ? line[..width] : line.PadRight(width);
 }
 
 static void UpdateStatusLine(BevdoxConfig config, bool refreshing, string refreshStatus)
@@ -326,5 +336,12 @@ static async Task HandleRenameAsync(List<DevBoxInstance> sorted, int selectedInd
     target.DisplayName = string.IsNullOrEmpty(newName) ? null : newName;
     await configStore.SaveAsync(config, ct);
     Console.WriteLine("  Renamed.");
+}
+
+// Progress<T> posts callbacks to the thread pool when there is no SynchronizationContext,
+// so updates can arrive out of order; report synchronously so the latest status wins.
+sealed class InlineProgress<T>(Action<T> handler) : IProgress<T>
+{
+    public void Report(T value) => handler(value);
 }
 
