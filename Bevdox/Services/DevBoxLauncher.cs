@@ -10,11 +10,12 @@ public sealed class DevBoxLauncher(AuthService auth)
 {
     private static readonly HttpClient Http = new();
 
-    public async Task LaunchAsync(DevBoxInstance instance, CancellationToken ct = default)
+    public async Task LaunchAsync(DevBoxInstance instance, IProgress<string>? progress = null, CancellationToken ct = default)
     {
         if (string.IsNullOrEmpty(instance.DevCenterUri))
             throw new InvalidOperationException($"No DevCenter URI available for '{instance.EffectiveName}'.");
 
+        progress?.Report("Authenticating to Dev Center...");
         var token = await auth.GetDevCenterTokenAsync(ct);
 
         // Extract user ID from the resource ID: .../users/{userId}/devboxes/{name}
@@ -29,6 +30,7 @@ public sealed class DevBoxLauncher(AuthService auth)
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
+        progress?.Report("Requesting remote connection...");
         using var response = await Http.SendAsync(request, ct);
         response.EnsureSuccessStatusCode();
 
@@ -39,7 +41,8 @@ public sealed class DevBoxLauncher(AuthService auth)
         var connectionUrl = (doc.RootElement.TryGetProperty("rdpConnectionUrl", out var rdp) ? rdp.GetString() : null)
             ?? throw new InvalidOperationException("Remote connection URL not available.");
 
-        Console.WriteLine($"Launching {instance.EffectiveName}...");
+        ct.ThrowIfCancellationRequested();
+        progress?.Report("Opening Remote Desktop...");
         Process.Start(new ProcessStartInfo(connectionUrl) { UseShellExecute = true });
     }
 }
